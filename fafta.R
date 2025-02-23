@@ -148,158 +148,88 @@ colnames(imf_nepal)
 ###############################################################################################
 # 5. Local Projection
 ###############################################################################################
-# 1) Create an indicator for Nepal being grey-listed from 2008 to 2014
-imf_nepal$grey_list <- as.integer(imf_nepal$year >= 2008 & imf_nepal$year <= 2014)
-
-# 2) (Optional) Sort imf_nepal by year if not already
-imf_nepal <- imf_nepal[order(imf_nepal$year), ]
-
-imf_nepal <- imf_nepal %>%
-  mutate(log_gdp = log(gdp_current_prices_billions_of_u_s_dollars)) %>%
-  mutate(log_net_lend = log(primary_net_lending_borrowing_also_referred_as_primary_balance_percent_of_gdp))
-
-# Local Projection Function
-run_local_projections <- function(df, y_var, event_var, control_vars = NULL, max_h = 3) {
-  if (!requireNamespace("dplyr", quietly = TRUE)) {
-    stop("Package 'dplyr' needed for this function to work. Please install it.")
-  }
-  library(dplyr)
-  
-  results_list <- list()
-  controls_formula <- if (!is.null(control_vars) && length(control_vars) > 0) {
-    paste(control_vars, collapse = " + ")
-  } else {
-    "1"
-  }
-  
-  for (h in 0:max_h) {
-    # Create a new variable that is the lead of the outcome variable
-    y_lead_var <- paste0(y_var, "_lead", h)
-    df[[y_lead_var]] <- dplyr::lead(df[[y_var]], n = h)
-    
-    # Build the regression formula
-    formula_str <- paste0(y_lead_var, " ~ ", event_var, " + ", controls_formula)
-    model <- lm(as.formula(formula_str), data = df)
-    results_list[[paste0("h=", h)]] <- summary(model)
-  }
-  
-  return(results_list)
-}
-
-# Identify outcome variables:
-# We select numeric columns and exclude 'year' and 'grey_list'
-numeric_vars <- names(imf_nepal)[sapply(imf_nepal, is.numeric)]
-outcome_vars <- setdiff(numeric_vars, c("year", "grey_list"))
-
-# Set maximum horizon for the local projection
-max_h <- 5
-
-# Create an empty data frame to store all IRF results
-all_irfs <- data.frame()
-
-# Loop over each numeric variable
-for (var in outcome_vars) {
-  # Run local projection for current variable with no additional controls
-  lp_res <- run_local_projections(
-    df = imf_nepal,
-    y_var = var,
-    event_var = "grey_list",
-    control_vars = NULL,
-    max_h = max_h
-  )
-  
-  # Create a temporary data frame for IRF for this variable
-  df_irf <- data.frame(
-    variable = var,
-    horizon = 0:max_h,
-    coef = NA,
-    se = NA
-  )
-  
-  # Extract the coefficient and standard error for 'grey_list' at each horizon
-  for (h in 0:max_h) {
-    model_summary <- lp_res[[paste0("h=", h)]]
-    coef_h <- model_summary$coefficients["grey_list", "Estimate"]
-    se_h   <- model_summary$coefficients["grey_list", "Std. Error"]
-    
-    df_irf[df_irf$horizon == h, "coef"] <- coef_h
-    df_irf[df_irf$horizon == h, "se"] <- se_h
-  }
-  
-  # Calculate 95% confidence intervals
-  df_irf <- df_irf %>%
-    mutate(lower = coef - 1.96 * se,
-           upper = coef + 1.96 * se)
-  
-  # Append the current variable's results to the overall IRF data frame
-  all_irfs <- rbind(all_irfs, df_irf)
-}
-
-# ------------------------------------------------------------------------------
-# 4. Visualize the IRFs for All Variables
-# ------------------------------------------------------------------------------
-
-ggplot(all_irfs, aes(x = horizon, y = coef)) +
-  geom_line(color = "blue") +
-  geom_point(color = "blue", size = 2) +
-  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "blue") +
-  facet_wrap(~ variable, scales = "free_y") +
-  labs(
-    x = "Horizon (years)",
-    y = "Coefficient on grey_list",
-    title = "Impulse Response Functions for All Numeric Variables via Local Projections"
-  ) +
-  theme_minimal()
-
-# ------------------------------------------------------------------------------
-# 4. Visualize 4 IRFs at a time
-# ------------------------------------------------------------------------------
-
+library(lpirfs)
 library(dplyr)
 library(ggplot2)
 library(ggpubr)
+library(ggplotify)  # For as.ggplot()
+library(grid)       # For grid.grabExpr()
 
-# Get unique variables from your IRF data
-unique_vars <- unique(all_irfs$variable)
-n_vars <- length(unique_vars)
-group_size <- 4  # number of variables per composite plot
-num_groups <- ceiling(n_vars / group_size)
+# ------------------------------------------------------------------------------
+# 1. Data Preparation
+# ------------------------------------------------------------------------------
 
-# Create an empty list to store each composite plot (page)
-plot_pages <- list()
+# Create an indicator for Nepal being grey-listed from 2008 to 2014
+imf_nepal$grey_list <- as.integer(imf_nepal$year >= 2008 & imf_nepal$year <= 2014)
 
-# Loop over groups of 4 variables
-for (i in 1:num_groups) {
+# Sort imf_nepal by year if not already
+imf_nepal <- imf_nepal[order(imf_nepal$year), ]
+
+# Optionally, create logged variables (ensure values are positive)
+imf_nepal <- imf_nepal %>%
+  mutate(log_gdp = log(gdp_current_prices_billions_of_u_s_dollars),
+         log_net_lend = log(primary_net_lending_borrowing_also_referred_as_primary_balance_percent_of_gdp))
+
+# ------------------------------------------------------------------------------
+# 2. Helper Function Using lp_lin()
+# ------------------------------------------------------------------------------
+
+# This function subsets the data to two columns (outcome, shock) and runs lp_lin().
+run_lp_lin_simple <- function(data, outcome_var, shock_var, horizon = 3, lags = 1) {
+  # Subset the required columns and ensure it is a data.frame
+  endog_data <- data[, c(outcome_var, shock_var)]
+  endog_data <- as.data.frame(endog_data)
   
-  # Determine indices for the current group
-  start_idx <- (i - 1) * group_size + 1
-  end_idx   <- min(i * group_size, n_vars)
+  # Rename columns so that the first is the outcome and the second is the shock.
+  colnames(endog_data) <- c(outcome_var, shock_var)
   
-  # Select variables for this group
-  selected_vars <- unique_vars[start_idx:end_idx]
+  # Run lp_lin() with a trend, 95% confidence bands, and a unit shock.
+  res <- lp_lin(
+    endog_data     = endog_data,
+    lags_endog_lin = lags,
+    hor            = horizon,
+    trend          = TRUE,
+    confint        = 1.96,
+    shock_type     = 1
+  )
   
-  # Create individual plots for each selected variable
-  plot_list <- lapply(selected_vars, function(v) {
-    df_subset <- filter(all_irfs, variable == v)
-    ggplot(df_subset, aes(x = horizon, y = coef)) +
-      geom_line(color = "blue") +
-      geom_point(color = "blue", size = 2) +
-      geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "blue") +
-      labs(title = v, x = "Horizon (years)", y = "Coefficient on grey_list") +
-      theme_minimal()
+  return(res)
+}
+
+# ------------------------------------------------------------------------------
+# 3. Run Local Projections for Each Outcome Variable
+# ------------------------------------------------------------------------------
+
+# Identify numeric variables and exclude "year" and "grey_list"
+numeric_vars <- names(imf_nepal)[sapply(imf_nepal, is.numeric)]
+outcome_vars <- setdiff(numeric_vars, c("year", "grey_list"))
+
+# Loop over each outcome variable and store the lp_lin() result in a list.
+lp_results_list <- list()
+for (v in outcome_vars) {
+  lp_obj <- tryCatch({
+    run_lp_lin_simple(
+      data        = imf_nepal,
+      outcome_var = v,
+      shock_var   = "grey_list",
+      horizon     = 3,
+      lags        = 1
+    )
+  }, error = function(e) {
+    message("Error for variable ", v, ": ", e$message)
+    return(NULL)
   })
+  lp_results_list[[v]] <- lp_obj
+}
+
+# Remove any outcomes where estimation failed
+lp_results_list <- lp_results_list[!sapply(lp_results_list, is.null)]
+
+for (var_name in names(lp_results_list)) {
+  obj <- lp_results_list[[var_name]]
   
-  # Arrange the four plots in a 2x2 grid using ggarrange
-  combined_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 2)
-  plot_pages[[i]] <- combined_plot
+  obj_irf <- plot(obj)
+  
+  print(obj_irf)  # display each plot
 }
-
-# Display all composite plots (pages)
-for (page in plot_pages) {
-  print(page)
-}
-
-
-
-
 
